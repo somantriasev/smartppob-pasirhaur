@@ -4563,17 +4563,46 @@ async function releaseSession(uid, userReference, sessionId) {
   clearStoredSessionId(uid);
 }
 
-async function handleSessionLostElsewhere(uid) {
+async function handleSessionLostElsewhere(
+  uid,
+  notice = "Sesi Anda berakhir karena akun ini login di perangkat lain."
+) {
   stopSessionHeartbeat();
   stopWatchingSessionTakeover();
   clearStoredSessionId(uid);
   currentSessionId = null;
 
-  pendingLoginNotice =
-    "Sesi Anda berakhir karena akun ini login di perangkat lain.";
+  pendingLoginNotice = notice;
 
   await signOut(auth);
 }
+
+// Satu browser bisa punya beberapa tab situs ini terbuka sekaligus — semua
+// berbagi localStorage yang sama tapi berjalan sebagai proses JS terpisah
+// (tidak saling tahu). Kalau satu tab logout (hapus sessionId dari
+// localStorage), event "storage" ini otomatis kedengaran di tab LAIN
+// (bukan di tab yang melakukan perubahan) supaya tab itu juga berhenti
+// heartbeat, bukannya diam-diam terus "menghidupkan" sesi yang sudah
+// dilepas tab sebelah — inilah yang bikin akun terasa "nyangkut" walau
+// user merasa sudah logout semua.
+window.addEventListener("storage", (event) => {
+  const uid = auth.currentUser?.uid;
+
+  if (!uid || !currentSessionId) {
+    return;
+  }
+
+  if (event.key !== SESSION_ID_STORAGE_PREFIX + uid) {
+    return;
+  }
+
+  if (event.newValue !== currentSessionId) {
+    handleSessionLostElsewhere(
+      uid,
+      "Anda sudah logout dari tab/jendela lain di browser ini."
+    );
+  }
+});
 
 async function renderLoggedIn(user) {
   renderRoleLoading();
