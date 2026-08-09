@@ -42,7 +42,7 @@ const VAPID_PUBLIC_KEY=
 "BHGqTP7bh826uIgoADQF7Eqs0iBTaMFYrFT1KTYs-lFCtZN9cG-EYufgqtpCOXoOzP9kO7VSQFosEtKmbIZnQ2Y";
 
 const QR_COOLDOWN_MS =
-  30 * 1000;
+  5 * 60 * 1000;
 
 // Batas satu akun Kios/Operator hanya aktif di satu perangkat. Heartbeat
 // menulis ulang lastActive tiap HEARTBEAT_INTERVAL_MS; sesi dianggap basi
