@@ -11,16 +11,18 @@ import {
   addDoc,
   arrayUnion,
   collection,
+  deleteField,
   doc,
   getDoc,
   getDocs,
   onSnapshot,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
   where,
-  writeBatch, 
+  writeBatch,
 } from "firebase/firestore";
   import {
     auth,
@@ -42,12 +44,29 @@ const VAPID_PUBLIC_KEY=
 const QR_COOLDOWN_MS =
   30 * 1000;
 
+// Batas satu akun Kios/Operator hanya aktif di satu perangkat. Heartbeat
+// menulis ulang lastActive tiap HEARTBEAT_INTERVAL_MS; sesi dianggap basi
+// (boleh direbut perangkat lain) kalau tidak ada heartbeat selama
+// SESSION_TIMEOUT_MS. Rasio 4x supaya 1-2 heartbeat yang telat (jaringan
+// putus sebentar, tab di-background) tidak memicu pengusiran palsu.
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const SESSION_TIMEOUT_MS = 120 * 1000;
+const SESSION_ID_STORAGE_PREFIX = "smartppobSessionId_";
+
 const urlParameters = new URLSearchParams(
   window.location.search
 );
 
 const isQrMode =
   urlParameters.get("mode") === "qr";
+
+// State sesi single-device untuk Kios/Operator (lihat claimOrRejectSession
+// dkk di dekat renderLoggedIn). Diisi sekali per login, dibersihkan saat
+// logout atau saat sesi direbut perangkat lain.
+let currentSessionId = null;
+let sessionHeartbeatTimer = null;
+let sessionTakeoverUnsubscribe = null;
+let pendingLoginNotice = null;
 
 function renderQrPage() {
   appElement.innerHTML = `
@@ -762,6 +781,9 @@ async function syncTransactionToSheet(
 }
 
 function renderLogin() {
+  const loginNotice = pendingLoginNotice;
+  pendingLoginNotice = null;
+
   appElement.innerHTML = `
     <main class="login-page">
       <section class="login-card">
@@ -773,6 +795,12 @@ function renderLogin() {
 
         <h1>SmartPPOB</h1>
         <p class="subtitle">Pencatatan transaksi kios</p>
+
+        ${
+          loginNotice
+            ? `<p class="form-message" role="alert">${loginNotice}</p>`
+            : ""
+        }
 
         <form id="loginForm" class="login-form">
           <label for="email">
@@ -907,6 +935,23 @@ function renderKioskPage(profile) {
             Riwayat
           </button>
         </nav>
+
+        <section class="notification-panel">
+          <div>
+            <strong>Notifikasi Kios</strong>
+            <p id="notificationStatus">
+              Aktifkan agar tahu saat top up selesai diproses.
+            </p>
+          </div>
+
+          <button
+            id="enableNotificationButton"
+            type="button"
+            class="notification-button"
+          >
+            🔔 Aktifkan
+          </button>
+        </section>
 
         <section id="transactionPage" class="tab-content">
           <form id="transactionForm" novalidate>
@@ -1240,6 +1285,7 @@ function renderKioskPage(profile) {
   `;
 
   attachLogoutButton();
+  attachPushNotificationUi("kiosk");
   attachKioskInteractions();
   attachDebtPage();
   attachHistoryPage();
@@ -3313,7 +3359,7 @@ function renderOperatorPage(profile) {
   attachLogoutButton();
   attachWhatsappTransactionForm();
   attachOperatorQueue();
-  attachOperatorNotifications();
+  attachPushNotificationUi("operator");
   attachHistoryPage();
   attachOperatorTabs();
 }
@@ -3342,7 +3388,7 @@ function attachOperatorTabs() {
   historyTab.addEventListener("click", () => openTab("history"));
 }
 
-  async function attachOperatorNotifications() {
+  async function attachPushNotificationUi(role) {
     const enableButton =
       document.querySelector(
         "#enableNotificationButton"
@@ -3415,7 +3461,7 @@ function attachOperatorTabs() {
 
             if (!auth.currentUser) {
               throw new Error(
-                "Akun Operator tidak ditemukan."
+                "Akun tidak ditemukan."
               );
             }
 
@@ -3423,12 +3469,12 @@ function attachOperatorTabs() {
               doc(
                 db,
                 "notificationTokens",
-                auth.currentUser.uid
+                token
               ),
               {
                 token,
                 userId: auth.currentUser.uid,
-                role: "operator",
+                role,
                 active: true,
 
                 deviceInfo: navigator.userAgent,
@@ -3482,7 +3528,7 @@ function attachOperatorTabs() {
       });
     } catch (error) {
       console.error(
-        "Gagal menyiapkan notifikasi Operator:",
+        `Gagal menyiapkan notifikasi ${role}:`,
         error
       );
 
@@ -4284,7 +4330,7 @@ function attachOperatorQueue() {
   }
 }
 
-function renderRoleError(message) {
+function renderMessageScreen(title, message) {
   appElement.innerHTML = `
     <main class="login-page">
       <section class="login-card">
@@ -4294,7 +4340,7 @@ function renderRoleError(message) {
           class="login-logo"
         />
 
-        <h1>Akun Belum Siap</h1>
+        <h1>${title}</h1>
         <p class="subtitle">${message}</p>
 
         <button id="logoutButton" type="button">
@@ -4307,12 +4353,188 @@ function renderRoleError(message) {
   attachLogoutButton();
 }
 
+function renderRoleError(message) {
+  renderMessageScreen("Akun Belum Siap", message);
+}
+
+function renderSessionBlockedScreen() {
+  renderMessageScreen(
+    "Akun Sedang Digunakan",
+    "Akun ini sedang aktif di perangkat lain. Tunggu beberapa saat atau logout dari perangkat tersebut, lalu coba lagi."
+  );
+}
+
 function attachLogoutButton() {
   document
     .querySelector("#logoutButton")
     .addEventListener("click", async () => {
+      const uid = auth.currentUser?.uid;
+      const sessionId = currentSessionId;
+
+      stopSessionHeartbeat();
+      stopWatchingSessionTakeover();
+      currentSessionId = null;
+
+      if (uid && sessionId) {
+        await releaseSession(uid, doc(db, "users", uid), sessionId);
+      }
+
       await signOut(auth);
     });
+}
+
+// --- Single-device session lock (Kios/Operator) ---
+//
+// Satu dokumen users/{uid} menyimpan activeSession: { sessionId, loginAt,
+// lastActive, device }. Perangkat yang berhasil klaim menyimpan sessionId-nya
+// sendiri di localStorage supaya reload di perangkat yang sama dikenali
+// sebagai kelanjutan sesi, bukan perangkat baru. Klaim & heartbeat memakai
+// runTransaction supaya dua perangkat tidak bisa klaim bersamaan, dan supaya
+// heartbeat tidak diam-diam menghidupkan lagi sesi yang sudah direbut
+// perangkat lain.
+
+function getStoredSessionId(uid) {
+  return localStorage.getItem(SESSION_ID_STORAGE_PREFIX + uid);
+}
+
+function setStoredSessionId(uid, sessionId) {
+  localStorage.setItem(SESSION_ID_STORAGE_PREFIX + uid, sessionId);
+}
+
+function clearStoredSessionId(uid) {
+  localStorage.removeItem(SESSION_ID_STORAGE_PREFIX + uid);
+}
+
+async function claimOrRejectSession(uid, userReference) {
+  const storedSessionId = getStoredSessionId(uid);
+
+  const result = await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(userReference);
+    const activeSession = snapshot.data()?.activeSession;
+
+    const isStale =
+      !activeSession?.lastActive ||
+      Date.now() - activeSession.lastActive.toMillis() >
+        SESSION_TIMEOUT_MS;
+
+    const isOurs =
+      Boolean(activeSession?.sessionId) &&
+      activeSession.sessionId === storedSessionId;
+
+    if (activeSession && !isStale && !isOurs) {
+      return { granted: false, sessionId: storedSessionId };
+    }
+
+    const sessionId = isOurs
+      ? storedSessionId
+      : crypto.randomUUID();
+
+    transaction.update(userReference, {
+      activeSession: {
+        sessionId,
+        loginAt: isOurs ? activeSession.loginAt : serverTimestamp(),
+        lastActive: serverTimestamp(),
+        device: navigator.userAgent.slice(0, 120),
+      },
+    });
+
+    return { granted: true, sessionId };
+  });
+
+  if (result.granted) {
+    setStoredSessionId(uid, result.sessionId);
+  }
+
+  return result;
+}
+
+function startSessionHeartbeat(uid, userReference, sessionId) {
+  stopSessionHeartbeat();
+
+  sessionHeartbeatTimer = setInterval(async () => {
+    try {
+      const stillOurs = await runTransaction(db, async (transaction) => {
+        const snapshot = await transaction.get(userReference);
+        const activeSession = snapshot.data()?.activeSession;
+
+        if (activeSession?.sessionId !== sessionId) {
+          return false;
+        }
+
+        transaction.update(userReference, {
+          "activeSession.lastActive": serverTimestamp(),
+        });
+
+        return true;
+      });
+
+      if (!stillOurs) {
+        await handleSessionLostElsewhere(uid);
+      }
+    } catch (error) {
+      console.warn("Heartbeat sesi gagal, akan dicoba lagi:", error);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopSessionHeartbeat() {
+  if (sessionHeartbeatTimer) {
+    clearInterval(sessionHeartbeatTimer);
+    sessionHeartbeatTimer = null;
+  }
+}
+
+function watchForSessionTakeover(uid, userReference, sessionId) {
+  stopWatchingSessionTakeover();
+
+  sessionTakeoverUnsubscribe = onSnapshot(userReference, (snapshot) => {
+    const activeSession = snapshot.data()?.activeSession;
+
+    if (
+      activeSession?.sessionId &&
+      activeSession.sessionId !== sessionId
+    ) {
+      handleSessionLostElsewhere(uid);
+    }
+  });
+}
+
+function stopWatchingSessionTakeover() {
+  if (sessionTakeoverUnsubscribe) {
+    sessionTakeoverUnsubscribe();
+    sessionTakeoverUnsubscribe = null;
+  }
+}
+
+async function releaseSession(uid, userReference, sessionId) {
+  try {
+    await runTransaction(db, async (transaction) => {
+      const snapshot = await transaction.get(userReference);
+      const activeSession = snapshot.data()?.activeSession;
+
+      if (activeSession?.sessionId === sessionId) {
+        transaction.update(userReference, {
+          activeSession: deleteField(),
+        });
+      }
+    });
+  } catch (error) {
+    console.warn("Gagal melepas sesi di server:", error);
+  }
+
+  clearStoredSessionId(uid);
+}
+
+async function handleSessionLostElsewhere(uid) {
+  stopSessionHeartbeat();
+  stopWatchingSessionTakeover();
+  clearStoredSessionId(uid);
+  currentSessionId = null;
+
+  pendingLoginNotice =
+    "Sesi Anda berakhir karena akun ini login di perangkat lain.";
+
+  await signOut(auth);
 }
 
 async function renderLoggedIn(user) {
@@ -4329,17 +4551,29 @@ async function renderLoggedIn(user) {
 
     const profile = userSnapshot.data();
 
+    if (profile.role !== "kiosk" && profile.role !== "operator") {
+      renderRoleError("Role akun tidak dikenali.");
+      return;
+    }
+
+    const claim = await claimOrRejectSession(user.uid, userReference);
+
+    if (!claim.granted) {
+      await signOut(auth);
+      renderSessionBlockedScreen();
+      return;
+    }
+
+    currentSessionId = claim.sessionId;
+    startSessionHeartbeat(user.uid, userReference, claim.sessionId);
+    watchForSessionTakeover(user.uid, userReference, claim.sessionId);
+
     if (profile.role === "kiosk") {
       renderKioskPage(profile);
       return;
     }
 
-    if (profile.role === "operator") {
-      renderOperatorPage(profile);
-      return;
-    }
-
-    renderRoleError("Role akun tidak dikenali.");
+    renderOperatorPage(profile);
   } catch (error) {
     console.error("Gagal membaca role:", error);
     renderRoleError("Gagal membaca data akun.");
