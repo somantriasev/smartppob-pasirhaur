@@ -3643,6 +3643,18 @@ function attachOperatorTabs() {
       return;
     }
 
+    // Notification.permission tersedia langsung tanpa perlu tunggu
+    // apapun -- dicek paling awal supaya tombol tidak sempat "kedip"
+    // balik ke Aktifkan sebelum setup messaging (yang perlu waktu
+    // memuat) selesai.
+    if (Notification.permission === "granted") {
+      notificationStatus.textContent =
+        "Izin notifikasi sudah diberikan.";
+
+      enableButton.textContent = "✓ Aktif";
+      enableButton.classList.add("enabled");
+    }
+
     try {
       const messaging = await getMessagingSafe();
 
@@ -3656,14 +3668,6 @@ function attachOperatorTabs() {
       }
 
       const { getToken, onMessage } = await import("firebase/messaging");
-
-      if (Notification.permission === "granted") {
-        notificationStatus.textContent =
-          "Izin notifikasi sudah diberikan.";
-
-        enableButton.textContent = "✓ Aktif";
-        enableButton.classList.add("enabled");
-      }
 
       enableButton.addEventListener(
         "click",
