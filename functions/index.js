@@ -4,11 +4,16 @@ const {
 } = require("firebase-functions/v2/firestore");
 
 const {
+  onSchedule,
+} = require("firebase-functions/v2/scheduler");
+
+const {
   initializeApp,
 } = require("firebase-admin/app");
 
 const {
   getFirestore,
+  FieldValue,
 } = require("firebase-admin/firestore");
 
 const {
@@ -16,6 +21,46 @@ const {
 } = require("firebase-admin/messaging");
 
 initializeApp();
+
+// Kode error FCM yang berarti token itu sudah tidak valid lagi (app
+// di-uninstall, izin notifikasi dicabut, dsb) -- bukan sekadar gagal
+// sementara karena jaringan/kuota.
+const INVALID_TOKEN_ERROR_CODES = [
+  "messaging/invalid-registration-token",
+  "messaging/registration-token-not-registered",
+];
+
+async function deactivateInvalidTokens(tokenDocs, response) {
+  const deactivations = response.responses
+    .map((result, index) => ({
+      result,
+      doc: tokenDocs[index],
+    }))
+    .filter(
+      ({ result }) =>
+        !result.success &&
+        INVALID_TOKEN_ERROR_CODES.includes(
+          result.error?.code
+        )
+    )
+    .map(({ doc }) =>
+      doc.ref.update({
+        active: false,
+        deactivatedAt: FieldValue.serverTimestamp(),
+      })
+    );
+
+  if (deactivations.length === 0) {
+    return;
+  }
+
+  await Promise.all(deactivations);
+
+  console.log(
+    "Token tidak valid dinonaktifkan:",
+    deactivations.length
+  );
+}
 
 exports.notifyOperatorOnNewTransaction =
   onDocumentCreated(
@@ -53,9 +98,13 @@ exports.notifyOperatorOnNewTransaction =
           .where("active", "==", true)
           .get();
 
-      const tokens = tokenSnapshot.docs
-        .map((doc) => doc.data().token)
-        .filter(Boolean);
+      const tokenDocs = tokenSnapshot.docs.filter(
+        (doc) => Boolean(doc.data().token)
+      );
+
+      const tokens = tokenDocs.map(
+        (doc) => doc.data().token
+      );
 
       if (tokens.length === 0) {
         console.log(
@@ -121,6 +170,8 @@ exports.notifyOperatorOnNewTransaction =
         "gagal:",
         response.failureCount
       );
+
+      await deactivateInvalidTokens(tokenDocs, response);
     }
   );
 
@@ -186,9 +237,13 @@ exports.notifyKioskOnTransactionCompletion =
           .where("active", "==", true)
           .get();
 
-      const tokens = tokenSnapshot.docs
-        .map((doc) => doc.data().token)
-        .filter(Boolean);
+      const tokenDocs = tokenSnapshot.docs.filter(
+        (doc) => Boolean(doc.data().token)
+      );
+
+      const tokens = tokenDocs.map(
+        (doc) => doc.data().token
+      );
 
       if (tokens.length === 0) {
         console.log(
@@ -255,6 +310,48 @@ exports.notifyKioskOnTransactionCompletion =
         response.successCount,
         "gagal:",
         response.failureCount
+      );
+
+      await deactivateInvalidTokens(tokenDocs, response);
+    }
+  );
+
+// Jadwal harian: token yang sudah dinonaktifkan (active === false) oleh
+// deactivateInvalidTokens di atas dihapus sungguhan dari koleksi supaya
+// tidak menumpuk selamanya sebagai data mati.
+exports.cleanupInactiveNotificationTokens =
+  onSchedule(
+    {
+      schedule: "every 24 hours",
+      region: "asia-southeast2",
+    },
+    async () => {
+      const db = getFirestore();
+
+      const inactiveSnapshot =
+        await db
+          .collection("notificationTokens")
+          .where("active", "==", false)
+          .get();
+
+      if (inactiveSnapshot.empty) {
+        console.log(
+          "Tidak ada token mati untuk dibersihkan."
+        );
+        return;
+      }
+
+      const batch = db.batch();
+
+      inactiveSnapshot.docs.forEach((doc) => {
+        batch.delete(doc.ref);
+      });
+
+      await batch.commit();
+
+      console.log(
+        "Token mati dibersihkan:",
+        inactiveSnapshot.size
       );
     }
   );
