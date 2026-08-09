@@ -53,6 +53,18 @@ const HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const SESSION_TIMEOUT_MS = 120 * 1000;
 const SESSION_ID_STORAGE_PREFIX = "smartppobSessionId_";
 
+// Kalau tidak ada interaksi (klik/ketik/sentuh/scroll) sama sekali selama
+// IDLE_TIMEOUT_MS, perangkat ini logout sendiri (lepas activeSession-nya
+// dengan bersih) supaya tab yang lupa ditutup tidak menyandera kunci sesi
+// selamanya. Dicek di tick heartbeat yang sama, tidak pakai timer sendiri.
+const IDLE_TIMEOUT_MS = 120 * 1000;
+const IDLE_ACTIVITY_EVENTS = [
+  "click",
+  "keydown",
+  "touchstart",
+  "scroll",
+];
+
 const urlParameters = new URLSearchParams(
   window.location.search
 );
@@ -67,6 +79,17 @@ let currentSessionId = null;
 let sessionHeartbeatTimer = null;
 let sessionTakeoverUnsubscribe = null;
 let pendingLoginNotice = null;
+let lastInteractionAt = Date.now();
+
+function markUserActive() {
+  lastInteractionAt = Date.now();
+}
+
+IDLE_ACTIVITY_EVENTS.forEach((eventName) => {
+  document.addEventListener(eventName, markUserActive, {
+    passive: true,
+  });
+});
 
 function renderQrPage() {
   appElement.innerHTML = `
@@ -4364,22 +4387,30 @@ function renderSessionBlockedScreen() {
   );
 }
 
+async function performLogout(notice) {
+  const uid = auth.currentUser?.uid;
+  const sessionId = currentSessionId;
+
+  stopSessionHeartbeat();
+  stopWatchingSessionTakeover();
+  currentSessionId = null;
+
+  if (uid && sessionId) {
+    await releaseSession(uid, doc(db, "users", uid), sessionId);
+  }
+
+  if (notice) {
+    pendingLoginNotice = notice;
+  }
+
+  await signOut(auth);
+}
+
 function attachLogoutButton() {
   document
     .querySelector("#logoutButton")
     .addEventListener("click", async () => {
-      const uid = auth.currentUser?.uid;
-      const sessionId = currentSessionId;
-
-      stopSessionHeartbeat();
-      stopWatchingSessionTakeover();
-      currentSessionId = null;
-
-      if (uid && sessionId) {
-        await releaseSession(uid, doc(db, "users", uid), sessionId);
-      }
-
-      await signOut(auth);
+      await performLogout();
     });
 }
 
@@ -4452,6 +4483,13 @@ function startSessionHeartbeat(uid, userReference, sessionId) {
   stopSessionHeartbeat();
 
   sessionHeartbeatTimer = setInterval(async () => {
+    if (Date.now() - lastInteractionAt > IDLE_TIMEOUT_MS) {
+      await performLogout(
+        "Anda otomatis keluar karena tidak ada aktivitas selama 2 menit."
+      );
+      return;
+    }
+
     try {
       const stillOurs = await runTransaction(db, async (transaction) => {
         const snapshot = await transaction.get(userReference);
