@@ -73,6 +73,47 @@ h1 {
   text-align: left;
 }
 
+.remember-device-label {
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 500;
+  color: #475569;
+}
+
+.remember-device-label input {
+  width: 20px;
+  min-height: 20px;
+}
+
+.pin-dots {
+  margin: 0 0 24px;
+  font-size: 26px;
+  letter-spacing: 10px;
+  color: #4f7fc5;
+}
+
+.pin-keypad .pin-key {
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.link-button {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px;
+  border: none;
+  background: none;
+  color: #4f7fc5;
+  font-size: 15px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 label {
   display: grid;
   gap: 8px;

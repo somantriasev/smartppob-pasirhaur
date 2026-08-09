@@ -65,6 +65,14 @@ const IDLE_ACTIVITY_EVENTS = [
   "scroll",
 ];
 
+// Login cepat khusus Kios: PIN 4 digit tetap, hanya berfungsi di
+// perangkat yang sudah pernah login lengkap dan ditandai "dipercaya"
+// (lihat getTrustedKioskDevice dkk di dekat renderLogin). Bukan lapisan
+// keamanan kuat -- murni kemudahan untuk pengguna Kios yang lansia.
+const KIOSK_QUICK_PIN = "0000";
+const KIOSK_TRUSTED_DEVICE_STORAGE_KEY = "smartppobKioskTrustedDevice";
+const KIOSK_QUICK_PIN_MAX_ATTEMPTS = 5;
+
 const urlParameters = new URLSearchParams(
   window.location.search
 );
@@ -79,6 +87,9 @@ let currentSessionId = null;
 let sessionHeartbeatTimer = null;
 let sessionTakeoverUnsubscribe = null;
 let pendingLoginNotice = null;
+let pendingRememberDeviceCredentials = null;
+let forceNormalLoginForm = false;
+let kioskQuickPinAttempts = 0;
 let lastInteractionAt = Date.now();
 
 function markUserActive() {
@@ -803,9 +814,67 @@ async function syncTransactionToSheet(
   }
 }
 
+// Bukan enkripsi sungguhan -- cuma supaya email/password tersimpan tidak
+// langsung kebaca polos sekilas pandang di panel localStorage devtools.
+// Batas keamanan sebenarnya tetap "siapa yang pegang fisik perangkat ini".
+function encodeForStorage(value) {
+  return btoa(unescape(encodeURIComponent(value)));
+}
+
+function decodeFromStorage(value) {
+  return decodeURIComponent(escape(atob(value)));
+}
+
+function getTrustedKioskDevice() {
+  try {
+    const raw = localStorage.getItem(
+      KIOSK_TRUSTED_DEVICE_STORAGE_KEY
+    );
+
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(decodeFromStorage(raw));
+
+    if (!parsed?.email || !parsed?.password) {
+      return null;
+    }
+
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+}
+
+function storeTrustedKioskDevice(email, password) {
+  localStorage.setItem(
+    KIOSK_TRUSTED_DEVICE_STORAGE_KEY,
+    encodeForStorage(JSON.stringify({ email, password }))
+  );
+}
+
+function clearTrustedKioskDevice() {
+  localStorage.removeItem(KIOSK_TRUSTED_DEVICE_STORAGE_KEY);
+}
+
 function renderLogin() {
+  const trusted = forceNormalLoginForm
+    ? null
+    : getTrustedKioskDevice();
+
+  if (trusted) {
+    renderKioskQuickPinEntry(trusted);
+    return;
+  }
+
+  renderLoginForm();
+}
+
+function renderLoginForm() {
   const loginNotice = pendingLoginNotice;
   pendingLoginNotice = null;
+  forceNormalLoginForm = false;
 
   appElement.innerHTML = `
     <main class="login-page">
@@ -851,6 +920,11 @@ function renderLogin() {
             />
           </label>
 
+          <label class="remember-device-label">
+            <input type="checkbox" id="rememberDevice" />
+            Ingat perangkat ini untuk login cepat (PIN)
+          </label>
+
           <p id="loginMessage" class="form-message" aria-live="polite"></p>
 
           <button id="loginButton" type="submit">
@@ -870,6 +944,7 @@ function renderLogin() {
 
     const email = loginForm.email.value.trim();
     const password = loginForm.password.value;
+    const rememberDevice = loginForm.rememberDevice.checked;
 
     loginButton.disabled = true;
     loginButton.textContent = "MEMERIKSA...";
@@ -877,6 +952,10 @@ function renderLogin() {
 
     try {
       await signInWithEmailAndPassword(auth, email, password);
+
+      if (rememberDevice) {
+        pendingRememberDeviceCredentials = { email, password };
+      }
     } catch (error) {
       console.error(error);
 
@@ -887,6 +966,144 @@ function renderLogin() {
       loginButton.textContent = "MASUK";
     }
   });
+}
+
+function renderKioskQuickPinEntry(trusted) {
+  let enteredPin = "";
+
+  appElement.innerHTML = `
+    <main class="login-page">
+      <section class="login-card">
+        <img
+          src="/icons/icon-192.png"
+          alt="Logo SmartPPOB"
+          class="login-logo"
+        />
+
+        <h1>SmartPPOB</h1>
+        <p class="subtitle">Masukkan PIN untuk masuk</p>
+
+        <p id="pinDots" class="pin-dots">○ ○ ○ ○</p>
+
+        <p id="pinMessage" class="form-message" aria-live="polite"></p>
+
+        <div class="type-grid pin-keypad">
+          <button class="choice-button pin-key" type="button" data-digit="1">1</button>
+          <button class="choice-button pin-key" type="button" data-digit="2">2</button>
+          <button class="choice-button pin-key" type="button" data-digit="3">3</button>
+          <button class="choice-button pin-key" type="button" data-digit="4">4</button>
+          <button class="choice-button pin-key" type="button" data-digit="5">5</button>
+          <button class="choice-button pin-key" type="button" data-digit="6">6</button>
+          <button class="choice-button pin-key" type="button" data-digit="7">7</button>
+          <button class="choice-button pin-key" type="button" data-digit="8">8</button>
+          <button class="choice-button pin-key" type="button" data-digit="9">9</button>
+          <button id="pinBackspace" class="choice-button pin-key" type="button">⌫</button>
+          <button class="choice-button pin-key" type="button" data-digit="0">0</button>
+          <span></span>
+        </div>
+
+        <button id="usePasswordButton" type="button" class="link-button">
+          Gunakan email &amp; password
+        </button>
+
+        <button id="forgetDeviceButton" type="button" class="link-button">
+          Lupakan perangkat ini
+        </button>
+      </section>
+    </main>
+  `;
+
+  const pinDots = document.querySelector("#pinDots");
+  const pinMessage = document.querySelector("#pinMessage");
+
+  function updateDots() {
+    pinDots.textContent = [0, 1, 2, 3]
+      .map((index) => (index < enteredPin.length ? "●" : "○"))
+      .join(" ");
+  }
+
+  async function submitPin() {
+    if (enteredPin !== KIOSK_QUICK_PIN) {
+      kioskQuickPinAttempts += 1;
+      enteredPin = "";
+      updateDots();
+
+      if (kioskQuickPinAttempts >= KIOSK_QUICK_PIN_MAX_ATTEMPTS) {
+        clearTrustedKioskDevice();
+        kioskQuickPinAttempts = 0;
+
+        pendingLoginNotice =
+          "PIN salah berkali-kali, silakan login pakai email & password.";
+
+        renderLogin();
+        return;
+      }
+
+      pinMessage.textContent = "PIN salah, coba lagi.";
+      return;
+    }
+
+    pinMessage.textContent = "Memeriksa...";
+
+    try {
+      await signInWithEmailAndPassword(
+        auth,
+        trusted.email,
+        trusted.password
+      );
+
+      kioskQuickPinAttempts = 0;
+    } catch (error) {
+      console.error("Login cepat PIN gagal:", error);
+
+      clearTrustedKioskDevice();
+
+      pendingLoginNotice =
+        "Login cepat gagal, silakan masuk dengan email & password.";
+
+      renderLogin();
+    }
+  }
+
+  document
+    .querySelectorAll(".pin-key[data-digit]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        if (enteredPin.length >= 4) {
+          return;
+        }
+
+        enteredPin += button.dataset.digit;
+        pinMessage.textContent = "";
+        updateDots();
+
+        if (enteredPin.length === 4) {
+          submitPin();
+        }
+      });
+    });
+
+  document
+    .querySelector("#pinBackspace")
+    .addEventListener("click", () => {
+      enteredPin = enteredPin.slice(0, -1);
+      pinMessage.textContent = "";
+      updateDots();
+    });
+
+  document
+    .querySelector("#usePasswordButton")
+    .addEventListener("click", () => {
+      forceNormalLoginForm = true;
+      renderLogin();
+    });
+
+  document
+    .querySelector("#forgetDeviceButton")
+    .addEventListener("click", () => {
+      clearTrustedKioskDevice();
+      renderLogin();
+    });
 }
 
 function renderRoleLoading() {
@@ -4622,6 +4839,20 @@ async function renderLoggedIn(user) {
       renderRoleError("Role akun tidak dikenali.");
       return;
     }
+
+    // Login cepat PIN khusus Kios -- simpan kredensial perangkat ini kalau
+    // tadi dicentang "ingat perangkat ini" waktu login lengkap.
+    if (
+      profile.role === "kiosk" &&
+      pendingRememberDeviceCredentials
+    ) {
+      storeTrustedKioskDevice(
+        pendingRememberDeviceCredentials.email,
+        pendingRememberDeviceCredentials.password
+      );
+    }
+
+    pendingRememberDeviceCredentials = null;
 
     const claim = await claimOrRejectSession(user.uid, userReference);
 
