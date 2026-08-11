@@ -4746,7 +4746,19 @@ function stopSessionHeartbeat() {
 function watchForSessionTakeover(uid, userReference, sessionId) {
   stopWatchingSessionTakeover();
 
+  // Snapshot pertama begitu listener dipasang cuma konfirmasi data yang
+  // baru saja kita tulis sendiri saat klaim -- kadang datang dari cache
+  // lokal yang sesaat masih basi, jadi bisa salah kebaca seolah sesi
+  // sudah direbut padahal belum. Diabaikan; baru mulai dipedulikan dari
+  // perubahan berikutnya (perubahan sungguhan dari perangkat lain).
+  let isFirstSnapshot = true;
+
   sessionTakeoverUnsubscribe = onSnapshot(userReference, (snapshot) => {
+    if (isFirstSnapshot) {
+      isFirstSnapshot = false;
+      return;
+    }
+
     const activeSession = snapshot.data()?.activeSession;
 
     if (
