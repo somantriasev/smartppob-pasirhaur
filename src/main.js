@@ -103,15 +103,35 @@ IDLE_ACTIVITY_EVENTS.forEach((eventName) => {
   });
 });
 
-// Tab yang di-background (pindah ke tab lain) kena throttle timer oleh
-// browser, jadi heartbeat/pengecekan idle bisa telat jalan. Begitu tab
-// ini keliatan lagi, langsung jalankan sekali di luar jadwal supaya tidak
-// perlu nunggu giliran interval berikutnya yang mungkin tertunda.
+// Tab yang di-background (pindah ke tab lain / laptop tidur) kena
+// throttle timer oleh browser, jadi heartbeat/pengecekan idle bisa telat
+// jalan -- dan koneksi Firestore-nya sendiri bisa jadi basi kalau
+// tersembunyi cukup lama, tidak selalu pulih sendiri tanpa reload penuh.
+// Kalau tersembunyi sebentar saja, cukup jalankan pengecekan sekali di
+// luar jadwal. Kalau sudah lebih lama dari batas kadaluarsa sesi,
+// langsung reload penuh -- lebih aman daripada mencoba menyambung ulang
+// koneksi lama yang mungkin sudah tidak sehat.
+let documentHiddenAt = null;
+
 document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    documentHiddenAt = Date.now();
+    return;
+  }
+
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+
   if (
-    document.visibilityState === "visible" &&
-    sessionHeartbeatTick
+    documentHiddenAt &&
+    Date.now() - documentHiddenAt > SESSION_TIMEOUT_MS
   ) {
+    window.location.reload();
+    return;
+  }
+
+  if (sessionHeartbeatTick) {
     sessionHeartbeatTick();
   }
 });
