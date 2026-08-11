@@ -85,6 +85,7 @@ const isQrMode =
 // logout atau saat sesi direbut perangkat lain.
 let currentSessionId = null;
 let sessionHeartbeatTimer = null;
+let sessionHeartbeatTick = null;
 let sessionTakeoverUnsubscribe = null;
 let pendingLoginNotice = null;
 let pendingRememberDeviceCredentials = null;
@@ -100,6 +101,19 @@ IDLE_ACTIVITY_EVENTS.forEach((eventName) => {
   document.addEventListener(eventName, markUserActive, {
     passive: true,
   });
+});
+
+// Tab yang di-background (pindah ke tab lain) kena throttle timer oleh
+// browser, jadi heartbeat/pengecekan idle bisa telat jalan. Begitu tab
+// ini keliatan lagi, langsung jalankan sekali di luar jadwal supaya tidak
+// perlu nunggu giliran interval berikutnya yang mungkin tertunda.
+document.addEventListener("visibilitychange", () => {
+  if (
+    document.visibilityState === "visible" &&
+    sessionHeartbeatTick
+  ) {
+    sessionHeartbeatTick();
+  }
 });
 
 function renderQrPage() {
@@ -4703,7 +4717,7 @@ async function claimOrRejectSession(uid, userReference) {
 function startSessionHeartbeat(uid, userReference, sessionId) {
   stopSessionHeartbeat();
 
-  sessionHeartbeatTimer = setInterval(async () => {
+  async function tick() {
     if (Date.now() - lastInteractionAt > IDLE_TIMEOUT_MS) {
       await performLogout(
         "Anda otomatis keluar karena tidak ada aktivitas selama 2 menit."
@@ -4733,7 +4747,10 @@ function startSessionHeartbeat(uid, userReference, sessionId) {
     } catch (error) {
       console.warn("Heartbeat sesi gagal, akan dicoba lagi:", error);
     }
-  }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  sessionHeartbeatTick = tick;
+  sessionHeartbeatTimer = setInterval(tick, HEARTBEAT_INTERVAL_MS);
 }
 
 function stopSessionHeartbeat() {
@@ -4741,6 +4758,8 @@ function stopSessionHeartbeat() {
     clearInterval(sessionHeartbeatTimer);
     sessionHeartbeatTimer = null;
   }
+
+  sessionHeartbeatTick = null;
 }
 
 function watchForSessionTakeover(uid, userReference, sessionId) {
