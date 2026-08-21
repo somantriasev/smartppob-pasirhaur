@@ -3108,17 +3108,32 @@ function attachHistoryPage(role) {
         </div>
 
         ${
-          role === "operator" &&
-          transaction.sellingPrice
+          role === "operator" && status === "success"
             ? `
               <div>
                 <span>Harga Jual</span>
                 <strong>
-                  ${formatHistoryMoney(
+                  ${
                     transaction.sellingPrice
-                  )}
+                      ? formatHistoryMoney(
+                          transaction.sellingPrice
+                        )
+                      : "Belum diisi"
+                  }
                 </strong>
               </div>
+
+              <button
+                id="editSellingPriceButton"
+                type="button"
+                class="back-button"
+              >
+                ${
+                  transaction.sellingPrice
+                    ? "Ubah Harga Jual"
+                    : "+ Isi Harga Jual"
+                }
+              </button>
             `
             : ""
         }
@@ -3184,6 +3199,26 @@ function attachHistoryPage(role) {
         history.back();
       }
     );
+
+    const editSellingPriceButton = document.querySelector(
+      "#editSellingPriceButton"
+    );
+
+    if (editSellingPriceButton) {
+      editSellingPriceButton.addEventListener("click", () => {
+        openSellingPriceModal(
+          transaction.sellingPrice,
+          async (sellingPrice) => {
+            await updateSellingPriceOnly(
+              transactionId,
+              sellingPrice
+            );
+
+            openHistoryDetail(transactionId);
+          }
+        );
+      });
+    }
   }
   function renderHistoryCards() {
     if (historyTransactions.length === 0) {
@@ -3710,6 +3745,7 @@ function renderOperatorPage(profile) {
 
   attachLogoutButton();
   attachWhatsappTransactionForm();
+  attachSellingPriceModal();
   attachOperatorQueue();
   attachPushNotificationUi("operator");
   attachHistoryPage("operator");
@@ -4451,51 +4487,42 @@ form.addEventListener("submit", async (event) => {
 
 }
 
-function attachOperatorQueue() {
-  const queueList = document.querySelector("#queueList");
-  const queueCount = document.querySelector("#queueCount");
-  const operatorMessage = document.querySelector("#operatorMessage");
+// Modal harga jual dipakai dari 2 tempat: konfirmasi Berhasil di Antrian,
+// dan ubah/isi harga jual dari detail Riwayat -- jadi state & fungsinya
+// di scope modul, bukan di dalam satu fungsi attach saja. Elemen modal-nya
+// sendiri statis di markup Operator (bukan bagian yang ditulis ulang tiap
+// snapshot Antrian/Riwayat berubah), jadi listener cukup dipasang sekali.
+let pendingSellingPriceSubmit = null;
 
-  // Modal harga jual -- elemen di luar #queueList (tidak ikut ditulis
-  // ulang tiap snapshot antrian berubah), jadi listener-nya cukup
-  // dipasang sekali di sini.
-  const sellingPriceModal =
-    document.querySelector("#sellingPriceModal");
-
+function attachSellingPriceModal() {
   const sellingPriceForm =
     document.querySelector("#sellingPriceForm");
 
-  const sellingPriceInput =
-    document.querySelector("#sellingPriceInput");
+  const cancelButton = document.querySelector(
+    "#cancelSellingPriceButton"
+  );
 
-  const sellingPriceMessage =
-    document.querySelector("#sellingPriceMessage");
+  const backdrop = document.querySelector(
+    "#sellingPriceModalBackdrop"
+  );
 
-  let pendingSuccessTransactionId = null;
-
-  function openSellingPriceModal(transactionId) {
-    pendingSuccessTransactionId = transactionId;
-    sellingPriceInput.value = "";
-    sellingPriceMessage.textContent = "";
-    sellingPriceModal.classList.remove("hidden-page");
-    sellingPriceInput.focus();
+  if (!sellingPriceForm || !cancelButton || !backdrop) {
+    return;
   }
 
-  function closeSellingPriceModal() {
-    pendingSuccessTransactionId = null;
-    sellingPriceModal.classList.add("hidden-page");
-  }
-
-  document
-    .querySelector("#cancelSellingPriceButton")
-    .addEventListener("click", closeSellingPriceModal);
-
-  document
-    .querySelector("#sellingPriceModalBackdrop")
-    .addEventListener("click", closeSellingPriceModal);
+  cancelButton.addEventListener("click", closeSellingPriceModal);
+  backdrop.addEventListener("click", closeSellingPriceModal);
 
   sellingPriceForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+
+    const sellingPriceInput = document.querySelector(
+      "#sellingPriceInput"
+    );
+
+    const sellingPriceMessage = document.querySelector(
+      "#sellingPriceMessage"
+    );
 
     const sellingPrice = Number(sellingPriceInput.value);
 
@@ -4505,15 +4532,64 @@ function attachOperatorQueue() {
       return;
     }
 
-    const transactionId = pendingSuccessTransactionId;
+    const onSubmit = pendingSellingPriceSubmit;
     closeSellingPriceModal();
 
-    await updateTransactionStatus(
-      transactionId,
-      "success",
-      sellingPrice
-    );
+    if (onSubmit) {
+      await onSubmit(sellingPrice);
+    }
   });
+}
+
+function openSellingPriceModal(currentValue, onSubmit) {
+  const sellingPriceModal = document.querySelector(
+    "#sellingPriceModal"
+  );
+
+  const sellingPriceInput = document.querySelector(
+    "#sellingPriceInput"
+  );
+
+  const sellingPriceMessage = document.querySelector(
+    "#sellingPriceMessage"
+  );
+
+  if (!sellingPriceModal) {
+    return;
+  }
+
+  pendingSellingPriceSubmit = onSubmit;
+  sellingPriceInput.value = currentValue || "";
+  sellingPriceMessage.textContent = "";
+  sellingPriceModal.classList.remove("hidden-page");
+  sellingPriceInput.focus();
+}
+
+function closeSellingPriceModal() {
+  const sellingPriceModal = document.querySelector(
+    "#sellingPriceModal"
+  );
+
+  pendingSellingPriceSubmit = null;
+
+  if (sellingPriceModal) {
+    sellingPriceModal.classList.add("hidden-page");
+  }
+}
+
+async function updateSellingPriceOnly(transactionId, sellingPrice) {
+  await updateDoc(doc(db, "transactions", transactionId), {
+    sellingPrice,
+    updatedAt: serverTimestamp(),
+  });
+
+  await syncTransactionToSheet(transactionId, { sellingPrice });
+}
+
+function attachOperatorQueue() {
+  const queueList = document.querySelector("#queueList");
+  const queueCount = document.querySelector("#queueCount");
+  const operatorMessage = document.querySelector("#operatorMessage");
 
   const waitingQuery = query(
     collection(db, "transactions"),
@@ -4678,7 +4754,15 @@ function attachOperatorQueue() {
         .querySelectorAll(".success-action-button")
         .forEach((button) => {
           button.addEventListener("click", () => {
-            openSellingPriceModal(button.dataset.id);
+            const transactionId = button.dataset.id;
+
+            openSellingPriceModal(null, (sellingPrice) =>
+              updateTransactionStatus(
+                transactionId,
+                "success",
+                sellingPrice
+              )
+            );
           });
         });
 
