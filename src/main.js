@@ -825,6 +825,11 @@ async function syncTransactionToSheet(
             ? completedAt.toISOString()
             : ""
         ),
+
+      sellingPrice:
+        overrides.sellingPrice ??
+        transaction.sellingPrice ??
+        "",
     };
 
     await fetch(SHEET_SYNC_URL, {
@@ -1562,7 +1567,7 @@ function renderKioskPage(profile) {
   attachPushNotificationUi("kiosk");
   attachKioskInteractions();
   attachDebtPage();
-  attachHistoryPage();
+  attachHistoryPage("kiosk");
 }
 
 function attachKioskInteractions() {
@@ -2920,7 +2925,7 @@ detailCustomerName.dataset.customerLabel =
   });
 }
 
-function attachHistoryPage() {
+function attachHistoryPage(role) {
     const historyList =
       document.querySelector("#historyList");
 
@@ -3101,6 +3106,22 @@ function attachHistoryPage() {
             )}
           </strong>
         </div>
+
+        ${
+          role === "operator" &&
+          transaction.sellingPrice
+            ? `
+              <div>
+                <span>Harga Jual</span>
+                <strong>
+                  ${formatHistoryMoney(
+                    transaction.sellingPrice
+                  )}
+                </strong>
+              </div>
+            `
+            : ""
+        }
 
         <div>
           <span>Pembayaran</span>
@@ -3626,6 +3647,63 @@ function renderOperatorPage(profile) {
             </div>
           </div>
         </section>
+
+        <div
+          id="sellingPriceModal"
+          class="history-modal hidden-page"
+        >
+          <div
+            class="history-modal-backdrop"
+            id="sellingPriceModalBackdrop"
+          ></div>
+
+          <div class="history-modal-card">
+            <div class="selling-price-body">
+              <h2>Harga Jual</h2>
+              <p class="selling-price-hint">
+                Masukkan harga jual sebelum menandai
+                transaksi ini Berhasil.
+              </p>
+
+              <form id="sellingPriceForm" class="login-form">
+                <label for="sellingPriceInput">
+                  Harga Jual (Rp)
+                  <input
+                    id="sellingPriceInput"
+                    type="number"
+                    inputmode="numeric"
+                    min="0"
+                    placeholder="Contoh: 12000"
+                    required
+                  />
+                </label>
+
+                <p
+                  id="sellingPriceMessage"
+                  class="form-message"
+                  aria-live="polite"
+                ></p>
+
+                <div class="selling-price-actions">
+                  <button
+                    id="cancelSellingPriceButton"
+                    type="button"
+                    class="cancel-button"
+                  >
+                    Batal
+                  </button>
+
+                  <button
+                    id="confirmSellingPriceButton"
+                    type="submit"
+                  >
+                    Konfirmasi
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
       </section>
     </main>
   `;
@@ -3634,7 +3712,7 @@ function renderOperatorPage(profile) {
   attachWhatsappTransactionForm();
   attachOperatorQueue();
   attachPushNotificationUi("operator");
-  attachHistoryPage();
+  attachHistoryPage("operator");
   attachOperatorTabs();
 }
 
@@ -4378,6 +4456,65 @@ function attachOperatorQueue() {
   const queueCount = document.querySelector("#queueCount");
   const operatorMessage = document.querySelector("#operatorMessage");
 
+  // Modal harga jual -- elemen di luar #queueList (tidak ikut ditulis
+  // ulang tiap snapshot antrian berubah), jadi listener-nya cukup
+  // dipasang sekali di sini.
+  const sellingPriceModal =
+    document.querySelector("#sellingPriceModal");
+
+  const sellingPriceForm =
+    document.querySelector("#sellingPriceForm");
+
+  const sellingPriceInput =
+    document.querySelector("#sellingPriceInput");
+
+  const sellingPriceMessage =
+    document.querySelector("#sellingPriceMessage");
+
+  let pendingSuccessTransactionId = null;
+
+  function openSellingPriceModal(transactionId) {
+    pendingSuccessTransactionId = transactionId;
+    sellingPriceInput.value = "";
+    sellingPriceMessage.textContent = "";
+    sellingPriceModal.classList.remove("hidden-page");
+    sellingPriceInput.focus();
+  }
+
+  function closeSellingPriceModal() {
+    pendingSuccessTransactionId = null;
+    sellingPriceModal.classList.add("hidden-page");
+  }
+
+  document
+    .querySelector("#cancelSellingPriceButton")
+    .addEventListener("click", closeSellingPriceModal);
+
+  document
+    .querySelector("#sellingPriceModalBackdrop")
+    .addEventListener("click", closeSellingPriceModal);
+
+  sellingPriceForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+
+    const sellingPrice = Number(sellingPriceInput.value);
+
+    if (!sellingPrice || sellingPrice <= 0) {
+      sellingPriceMessage.textContent =
+        "Harga jual harus lebih dari 0.";
+      return;
+    }
+
+    const transactionId = pendingSuccessTransactionId;
+    closeSellingPriceModal();
+
+    await updateTransactionStatus(
+      transactionId,
+      "success",
+      sellingPrice
+    );
+  });
+
   const waitingQuery = query(
     collection(db, "transactions"),
     where("processingStatus", "==", "waiting")
@@ -4540,11 +4677,8 @@ function attachOperatorQueue() {
       document
         .querySelectorAll(".success-action-button")
         .forEach((button) => {
-          button.addEventListener("click", async () => {
-            await updateTransactionStatus(
-              button.dataset.id,
-              "success"
-            );
+          button.addEventListener("click", () => {
+            openSellingPriceModal(button.dataset.id);
           });
         });
 
@@ -4569,25 +4703,35 @@ function attachOperatorQueue() {
 
   async function updateTransactionStatus(
     transactionId,
-    newStatus
+    newStatus,
+    sellingPrice
   ) {
     operatorMessage.textContent = "Memperbarui status...";
 
     try {
+      const updateData = {
+        processingStatus: newStatus,
+        completedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      if (newStatus === "success" && sellingPrice) {
+        updateData.sellingPrice = sellingPrice;
+      }
+
       await updateDoc(
         doc(db, "transactions", transactionId),
-        {
-          processingStatus: newStatus,
-          completedAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }
+        updateData
       );
 
       await syncTransactionToSheet(
         transactionId,
-         {
-           processingStatus: newStatus,
+        {
+          processingStatus: newStatus,
           completedAt: new Date().toISOString(),
+          ...(newStatus === "success" && sellingPrice
+            ? { sellingPrice }
+            : {}),
         }
       );
 

@@ -1424,6 +1424,26 @@ button:active {
   padding: 16px;
 }
 
+.selling-price-body h2 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.selling-price-hint {
+  margin: 0 0 16px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.selling-price-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.selling-price-actions button {
+  flex: 1;
+}
+
 @media (max-width: 480px) {
   .kiosk-app .app-tabs {
     top: 70px;
